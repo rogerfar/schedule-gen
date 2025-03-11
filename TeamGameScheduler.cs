@@ -21,8 +21,8 @@ internal class TeamGameScheduler
     private List<TimeSpan> _gameTimes = [];
     private Int32 _generateAttempts;
     private Int32 _saveTop;
-    private Int32 _maxThreads;
     private Int32 _minScore;
+    private Int32 _maxThreads;
     private String? _outputDir;
     private DateTime _startDate;
     private DateTime _timerStart;
@@ -30,6 +30,7 @@ internal class TeamGameScheduler
     private Int32 _totalAttempts;
     private Int32 _totalTeams;
     private Int32 _validAttempts;
+    private Int32 _highestFound = Int32.MinValue;
 
     public TeamGameScheduler()
     {
@@ -48,9 +49,9 @@ internal class TeamGameScheduler
             new(18, 15, 0),
             new(19, 45, 0)
         };
-        var defaultGenerateAttempts = 10000;
+        var defaultGenerateAttempts = 100;
+        var defaultMinScore = 2000;
         var defaultSaveTop = 10;
-        var defaultMinimumScore = 550;
         var defaultMaxThreads = Environment.ProcessorCount * 2;
 
 #if DEBUG
@@ -62,7 +63,7 @@ internal class TeamGameScheduler
         _gameTimes = defaultGameTimes;
         _generateAttempts = defaultGenerateAttempts;
         _saveTop = defaultSaveTop;
-        _minScore = defaultMinimumScore;
+        _minScore = defaultMinScore;
         _maxThreads = defaultMaxThreads;
 #else
         _startDate = ReadDateFromConsole("Season start date (YYYY-MM-DD)", defaultStartDate, "yyyy-MM-dd");
@@ -73,7 +74,7 @@ internal class TeamGameScheduler
         _gameTimes = ReadTimeSpansFromConsole("List of game times as HH:mm, separate multiple with a comma", defaultGameTimes);
         _generateAttempts = ReadIntFromConsole("Number of schedules to generate", defaultGenerateAttempts, 1);
         _saveTop = ReadIntFromConsole("Save top schedules", defaultSaveTop, 1);
-        _minScore = ReadIntFromConsole("Minimum score", defaultMinimumScore);
+        _minScore = ReadIntFromConsole("Minimum score", defaultMinScore);
         _maxThreads = ReadIntFromConsole("Maximum threads to use", defaultMaxThreads);
 #endif
     }
@@ -121,17 +122,14 @@ internal class TeamGameScheduler
 
         updateThread.Join(2000);
 
-        var index = 1;
-        foreach (var result in _results.OrderByDescending(r => r.Score))
-        {
-            SaveScheduleWithStats(result.Schedule, result.Score, index++);
-        }
-
         var totalTime = DateTime.UtcNow - _timerStart;
         Console.Clear();
         Console.WriteLine($"Generation completed in {totalTime}!");
         Console.WriteLine($"Tried {_totalAttempts:N0} total schedules to find {_validAttempts:N0} valid ones ({_validAttempts * 100.0 / _totalAttempts:F2}% valid)");
         Console.WriteLine($"Rate: {_totalAttempts / totalTime.TotalSeconds:F2} attempts/second ({_validAttempts / totalTime.TotalSeconds:F2} valid/second)");
+        Console.WriteLine($"Lowest score: {_results.Min(r => r.Score)}");
+        Console.WriteLine($"Highest score: {_results.Max(r => r.Score)}");
+        Console.WriteLine($"Average score: {_results.Average(r => r.Score):F2}");
     }
 
     private Thread CreateTimer()
@@ -152,6 +150,7 @@ internal class TeamGameScheduler
                 var status = $"Time: {elapsed.Hours:00}:{elapsed.Minutes:00}:{elapsed.Seconds:00} | " +
                              $"Valid: {_validAttempts:N0}/{_generateAttempts:N0} ({perc:F2}%) | " +
                              $"Rate: {rate:F2}/s | " +
+                             $"Highest so far: {_highestFound} | " +
                              "Press Ctrl+C to stop";
 
                 Console.SetCursorPosition(0, 0);
@@ -315,21 +314,29 @@ internal class TeamGameScheduler
         }
         
         var score = ScoreSchedule(schedule);
-
-        if (score < _minScore)
-        {
-            return;
-        }
-
+        
         lock (_lock)
         {
+            if (score > _highestFound)
+            {
+                _highestFound = score;
+
+                SaveScheduleWithStats(schedule, score);
+            }
+
+            if (score < _minScore)
+            {
+                return;
+            }
+
             _results.Add(new()
             {
                 Schedule = schedule,
                 Score = score
             });
 
-            // Only keep _saveTop
+            SaveScheduleWithStats(schedule, score);
+
             while (_results.Count > _saveTop)
             {
                 var item = _results.OrderByDescending(m => m.Score).First();
@@ -543,26 +550,43 @@ internal class TeamGameScheduler
     {
         var score = 0;
         var teamSingleGameStats = new Dictionary<Int32, (Int32 Early, Int32 Late)>();
-        var teamDoubleHeaders = new Dictionary<Int32, Int32>();
 
         // Initialize stats
         for (var i = 1; i <= _totalTeams; i++)
         {
             teamSingleGameStats[i] = (0, 0);
-            teamDoubleHeaders[i] = 0;
         }
 
-        // Group games by date
-        var gamesByDate = schedule
-                          .GroupBy(g => g.GameDate)
-                          .ToDictionary(g => g.Key, g => g.ToList());
+        // Get all possible dates between start and end date
+        var allPossibleDates = Enumerable.Range(0, (_endDate - _startDate).Days + 1)
+                                         .Select(days => _startDate.AddDays(days))
+                                         .Where(date => date.DayOfWeek == DayOfWeek.Tuesday)
+                                         .OrderBy(d => d)
+                                         .ToList();
 
-        // Count single games and double headers
-        foreach (var dateGames in gamesByDate.Values)
+        // Track consecutive singles for each team
+        var currentConsecutiveSingles = new Dictionary<Int32, Int32>();
+
+        for (var i = 1; i <= _totalTeams; i++)
         {
+            currentConsecutiveSingles[i] = 0;
+        }
+
+        // Analyze each possible date
+        foreach (var date in allPossibleDates)
+        {
+            var gamesOnDate = schedule.Where(g => g.GameDate == date).ToList();
+            var teamsPlayingToday = new HashSet<Int32>();
+
+            foreach (var game in gamesOnDate)
+            {
+                teamsPlayingToday.Add(game.HomeTeam);
+                teamsPlayingToday.Add(game.AwayTeam);
+            }
+
             var teamsGamesForDay = new Dictionary<Int32, List<Game>>();
 
-            foreach (var game in dateGames)
+            foreach (var game in gamesOnDate)
             {
                 if (!teamsGamesForDay.ContainsKey(game.HomeTeam))
                 {
@@ -578,41 +602,62 @@ internal class TeamGameScheduler
                 teamsGamesForDay[game.AwayTeam].Add(game);
             }
 
-            foreach (var (team, games) in teamsGamesForDay)
+            // Process each team's games or bye
+            for (var team = 1; team <= _totalTeams; team++)
             {
-                if (games.Count == 1) // Single game
+                if (!teamsPlayingToday.Contains(team))
                 {
-                    var stats = teamSingleGameStats[team];
+                    // Team has a bye
+                    currentConsecutiveSingles[team] = 0; // Reset consecutive singles counter
+                    score += 50; // Bonus for having a bye (better than single early game)
 
-                    if (games[0].GameTime == _gameTimes[0]) // Early game
-                    {
-                        teamSingleGameStats[team] = (stats.Early + 1, stats.Late);
-                    }
-                    else // Late game
-                    {
-                        teamSingleGameStats[team] = (stats.Early, stats.Late + 1);
-                    }
+                    continue;
                 }
-                else if (games.Count == 2) // Double header
+
+                if (teamsGamesForDay.TryGetValue(team, out var games))
                 {
-                    teamDoubleHeaders[team]++;
+                    if (games.Count == 1) // Single game
+                    {
+                        currentConsecutiveSingles[team]++;
+
+                        // Penalize consecutive singles with exponential growth
+                        if (currentConsecutiveSingles[team] > 1)
+                        {
+                            // For 2 consecutive: -200
+                            // For 3 consecutive: -400
+                            // For 4 consecutive: -800
+                            // etc.
+                            score -= (Int32)Math.Pow(2, currentConsecutiveSingles[team]) * 100;
+                        }
+
+                        var stats = teamSingleGameStats[team];
+
+                        if (games[0].GameTime == _gameTimes[0]) // Early game
+                        {
+                            teamSingleGameStats[team] = (stats.Early + 1, stats.Late);
+                            score -= 100; // Penalty for early single game
+                        }
+                        else // Late game
+                        {
+                            teamSingleGameStats[team] = (stats.Early, stats.Late + 1);
+                            score += 25; // Small bonus for late game
+                        }
+                    }
+                    else if (games.Count == 2) // Double header
+                    {
+                        currentConsecutiveSingles[team] = 0; // Reset consecutive singles counter
+                        score += 75; // Moderate bonus for double header (breaks up single game stretches)
+                    }
                 }
             }
         }
 
-        // Score based on late game distribution
-        foreach (var (_, stats) in teamSingleGameStats)
-        {
-            // Add points for late games
-            score += stats.Late * 10;
-        }
-        
         return score;
     }
 
-    private void SaveScheduleWithStats(List<Game> schedule, Int32 score, Int32 currentIndex)
+    private void SaveScheduleWithStats(List<Game> schedule, Int32 score)
     {
-        var filename = $"{score:D4}_{currentIndex:D6}.xlsx";
+        var filename = $"{score:D4}.xlsx";
         var workbook = new XLWorkbook();
 
         // Worksheet 1: General Stats
