@@ -6,6 +6,11 @@ namespace TeamGamePlanner;
 
 internal class TeamGameScheduler
 {
+    private const Int32 BASE_SCORE = 1000;
+    private const Int32 SPREAD_PENALTY_MULTIPLIER = 250;  // Applied to all distribution penalties
+    private const Int32 POINTS_DOUBLEHEADER = 40;        // Base bonus for having a double header
+    private const Int32 POINTS_BYE_WEEK = 20;            // Bonus for having a bye week
+    
     private static readonly ThreadLocal<Random> ThreadRandom = new(() => new(Interlocked.Increment(ref _seed)));
     private static Int32 _seed = Environment.TickCount;
 
@@ -312,21 +317,21 @@ internal class TeamGameScheduler
         {
             return;
         }
+
+        if (!ValidateSingleGames(schedule, 2))
+        {
+            return;
+        }
         
         var score = ScoreSchedule(schedule);
         
         lock (_lock)
         {
-            if (score > _highestFound)
+            if (score > _highestFound && score >= _minScore)
             {
                 _highestFound = score;
 
                 SaveScheduleWithStats(schedule, score);
-            }
-
-            if (score < _minScore)
-            {
-                return;
             }
 
             _results.Add(new()
@@ -546,46 +551,102 @@ internal class TeamGameScheduler
         return teamDoubleHeaders.All(kvp => kvp.Value >= _doubleHeadersNeeded);
     }
 
-    private Int32 ScoreSchedule(List<Game> schedule)
+    private Boolean ValidateSingleGames(List<Game> schedule, Int32 maxConsecutiveSingles)
     {
-        var score = 0;
+        var teamGames = new Dictionary<Int32, List<(DateTime date, Int32 gameCount)>>();
+
+        // First, organize all games by team and date, counting games per date
+        for (var team = 1; team <= _totalTeams; team++)
+        {
+            var gamesForTeam = schedule
+                .Where(g => g.HomeTeam == team || g.AwayTeam == team)
+                .GroupBy(g => g.GameDate)
+                .Select(g => (date: g.Key, gameCount: g.Count()))
+                .OrderBy(g => g.date)
+                .ToList();
+
+            teamGames[team] = gamesForTeam;
+        }
+
+        // Now check each team's game pattern
+        foreach (var (team, games) in teamGames)
+        {
+            var consecutiveSingles = 0;
+            var foundFirstDoubleHeader = false;
+
+            for (var i = 0; i < games.Count; i++)
+            {
+                if (games[i].gameCount == 2)
+                {
+                    // Found a double header
+                    foundFirstDoubleHeader = true;
+                    consecutiveSingles = 0;
+                }
+                else if (games[i].gameCount == 1)
+                {
+                    if (foundFirstDoubleHeader)
+                    {
+                        consecutiveSingles++;
+                        
+                        // Check if we've exceeded our limit of consecutive singles
+                        if (consecutiveSingles > maxConsecutiveSingles)
+                        {
+                            // Look ahead to see if there's another double header
+                            var hasAnotherDoubleHeader = false;
+                            for (var j = i + 1; j < games.Count; j++)
+                            {
+                                if (games[j].gameCount == 2)
+                                {
+                                    hasAnotherDoubleHeader = true;
+                                    break;
+                                }
+                            }
+
+                            // Only fail validation if this stretch of singles is between two double headers
+                            if (hasAnotherDoubleHeader)
+                            {
+                                return false; // Found more than maxConsecutiveSingles consecutive singles between double headers
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return true; // All teams pass validation
+    }
+
+    public Int32 ScoreSchedule(List<Game> schedule)
+    {
+        var score = BASE_SCORE;
+
+        // Track statistics per team
+        var teamDoubleHeaders = new Dictionary<Int32, Int32>();
         var teamSingleGameStats = new Dictionary<Int32, (Int32 Early, Int32 Late)>();
+        var teamConsecutiveSingles = new Dictionary<Int32, Dictionary<DateTime, Int32>>();
 
-        // Initialize stats
+        // Initialize tracking dictionaries
         for (var i = 1; i <= _totalTeams; i++)
         {
+            teamDoubleHeaders[i] = 0;
             teamSingleGameStats[i] = (0, 0);
+            teamConsecutiveSingles[i] = new();
         }
 
-        // Get all possible dates between start and end date
+        // Get all possible game dates (Tuesdays)
         var allPossibleDates = Enumerable.Range(0, (_endDate - _startDate).Days + 1)
-                                         .Select(days => _startDate.AddDays(days))
-                                         .Where(date => date.DayOfWeek == DayOfWeek.Tuesday)
-                                         .OrderBy(d => d)
-                                         .ToList();
+                                       .Select(days => _startDate.AddDays(days))
+                                       .Where(date => date.DayOfWeek == DayOfWeek.Tuesday)
+                                       .OrderBy(d => d)
+                                       .ToList();
 
-        // Track consecutive singles for each team
-        var currentConsecutiveSingles = new Dictionary<Int32, Int32>();
-
-        for (var i = 1; i <= _totalTeams; i++)
-        {
-            currentConsecutiveSingles[i] = 0;
-        }
-
-        // Analyze each possible date
+        // Process games date by date
         foreach (var date in allPossibleDates)
         {
             var gamesOnDate = schedule.Where(g => g.GameDate == date).ToList();
-            var teamsPlayingToday = new HashSet<Int32>();
-
-            foreach (var game in gamesOnDate)
-            {
-                teamsPlayingToday.Add(game.HomeTeam);
-                teamsPlayingToday.Add(game.AwayTeam);
-            }
-
             var teamsGamesForDay = new Dictionary<Int32, List<Game>>();
 
+            // Group games by team
             foreach (var game in gamesOnDate)
             {
                 if (!teamsGamesForDay.ContainsKey(game.HomeTeam))
@@ -602,55 +663,117 @@ internal class TeamGameScheduler
                 teamsGamesForDay[game.AwayTeam].Add(game);
             }
 
-            // Process each team's games or bye
+            // Process each team's games for the day
             for (var team = 1; team <= _totalTeams; team++)
             {
-                if (!teamsPlayingToday.Contains(team))
+                if (!teamsGamesForDay.TryGetValue(team, out var games))
                 {
                     // Team has a bye
-                    currentConsecutiveSingles[team] = 0; // Reset consecutive singles counter
-                    score += 50; // Bonus for having a bye (better than single early game)
-
+                    teamConsecutiveSingles[team][date] = 0;
+                    score += POINTS_BYE_WEEK;
                     continue;
                 }
 
-                if (teamsGamesForDay.TryGetValue(team, out var games))
+                if (games.Count == 1) // Single game
                 {
-                    if (games.Count == 1) // Single game
+                    // Track consecutive singles
+                    var previousDate = allPossibleDates
+                        .Where(d => d < date)
+                        .OrderByDescending(d => d)
+                        .FirstOrDefault();
+
+                    var previousCount = previousDate != default 
+                        ? teamConsecutiveSingles[team].GetValueOrDefault(previousDate, 0) 
+                        : 0;
+
+                    teamConsecutiveSingles[team][date] = previousCount + 1;
+
+                    // Track early/late distribution
+                    var stats = teamSingleGameStats[team];
+                    if (games[0].GameTime == _gameTimes[0]) // Early game
                     {
-                        currentConsecutiveSingles[team]++;
-
-                        // Penalize consecutive singles with exponential growth
-                        if (currentConsecutiveSingles[team] > 1)
-                        {
-                            // For 2 consecutive: -200
-                            // For 3 consecutive: -400
-                            // For 4 consecutive: -800
-                            // etc.
-                            score -= (Int32)Math.Pow(2, currentConsecutiveSingles[team]) * 100;
-                        }
-
-                        var stats = teamSingleGameStats[team];
-
-                        if (games[0].GameTime == _gameTimes[0]) // Early game
-                        {
-                            teamSingleGameStats[team] = (stats.Early + 1, stats.Late);
-                            score -= 100; // Penalty for early single game
-                        }
-                        else // Late game
-                        {
-                            teamSingleGameStats[team] = (stats.Early, stats.Late + 1);
-                            score += 25; // Small bonus for late game
-                        }
+                        teamSingleGameStats[team] = (stats.Early + 1, stats.Late);
                     }
-                    else if (games.Count == 2) // Double header
+                    else // Late game
                     {
-                        currentConsecutiveSingles[team] = 0; // Reset consecutive singles counter
-                        score += 75; // Moderate bonus for double header (breaks up single game stretches)
+                        teamSingleGameStats[team] = (stats.Early, stats.Late + 1);
                     }
+                }
+                else if (games.Count == 2) // Double header
+                {
+                    teamConsecutiveSingles[team][date] = 0;
+                    teamDoubleHeaders[team]++;
+                    score += POINTS_DOUBLEHEADER;
                 }
             }
         }
+
+        // Score double header distribution
+        var minDoubleHeaders = teamDoubleHeaders.Values.Min();
+        var maxDoubleHeaders = teamDoubleHeaders.Values.Max();
+        var avgDoubleHeaders = teamDoubleHeaders.Values.Average();
+        
+        var dhVariance = teamDoubleHeaders.Values
+            .Select(dh => Math.Pow(dh - avgDoubleHeaders, 2))
+            .Average();
+        var dhStandardDeviation = Math.Sqrt(dhVariance);
+
+        var dhSpreadPenalty = (maxDoubleHeaders - minDoubleHeaders) * SPREAD_PENALTY_MULTIPLIER;
+        var dhDeviationPenalty = (Int32)(dhStandardDeviation * SPREAD_PENALTY_MULTIPLIER);
+        
+        score -= dhSpreadPenalty;
+        score -= dhDeviationPenalty;
+
+        // Score consecutive singles distribution
+        var maxConsecutiveSingles = new Dictionary<Int32, Int32>();
+        for (var team = 1; team <= _totalTeams; team++)
+        {
+            maxConsecutiveSingles[team] = teamConsecutiveSingles[team].Values.Max();
+        }
+
+        var minConsecutive = maxConsecutiveSingles.Values.Min();
+        var maxConsecutive = maxConsecutiveSingles.Values.Max();
+        var avgConsecutive = maxConsecutiveSingles.Values.Average();
+
+        var csVariance = maxConsecutiveSingles.Values
+            .Select(cs => Math.Pow(cs - avgConsecutive, 2))
+            .Average();
+        var csStandardDeviation = Math.Sqrt(csVariance);
+
+        var csSpreadPenalty = (maxConsecutive - minConsecutive) * SPREAD_PENALTY_MULTIPLIER;
+        var csDeviationPenalty = (Int32)(csStandardDeviation * SPREAD_PENALTY_MULTIPLIER);
+
+        score -= csSpreadPenalty;
+        score -= csDeviationPenalty;
+
+        // Score early vs late game distribution
+        var earlyLateImbalances = new Dictionary<Int32, Int32>();
+
+        foreach (var team in teamSingleGameStats.Keys)
+        {
+            var (early, late) = teamSingleGameStats[team];
+            var totalSingles = early + late;
+            
+            // Calculate imbalance (how far from 50/50 split)
+            var idealEarly = totalSingles / 2.0;
+            var imbalance = Math.Abs(early - idealEarly);
+            earlyLateImbalances[team] = (Int32)Math.Round(imbalance);
+        }
+
+        var minImbalance = earlyLateImbalances.Values.Min();
+        var maxImbalance = earlyLateImbalances.Values.Max();
+        var avgImbalance = earlyLateImbalances.Values.Average();
+
+        var elVariance = earlyLateImbalances.Values
+            .Select(imb => Math.Pow(imb - avgImbalance, 2))
+            .Average();
+        var elStandardDeviation = Math.Sqrt(elVariance);
+
+        var elSpreadPenalty = (maxImbalance - minImbalance) * SPREAD_PENALTY_MULTIPLIER;
+        var elDeviationPenalty = (Int32)(elStandardDeviation * SPREAD_PENALTY_MULTIPLIER);
+
+        score -= elSpreadPenalty;
+        score -= elDeviationPenalty;
 
         return score;
     }
